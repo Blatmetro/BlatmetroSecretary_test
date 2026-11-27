@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,6 +36,8 @@ MODEL_NAME = os.getenv("MODEL_NAME", "local-model")
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
 MAX_REPLY_TOKENS = int(os.getenv("MAX_REPLY_TOKENS", "160"))
+MAX_TELEGRAM_TEXT_LENGTH = 4096
+MIN_TELEGRAM_EDIT_INTERVAL = 1.0
 DB_FILE = Path(__file__).resolve().parent / "data" / "secretary.sqlite3"
 
 SYSTEM_PROMPT = """
@@ -822,21 +825,62 @@ async def keep_typing(chat):
         await asyncio.sleep(4)
 
 
-async def edit_stream_message(context, message, text):
-    text = text.strip() or "…"
-    await context.bot.edit_message_text(
-        text=text,
-        chat_id=message.chat_id,
-        message_id=message.message_id,
+def fit_telegram_text(text):
+    text = (text or "").strip() or "…"
+    if len(text.encode("utf-16-le")) // 2 > MAX_TELEGRAM_TEXT_LENGTH:
+        prefix = []
+        text_units = 0
+        for char in text:
+            char_units = 2 if ord(char) > 0xFFFF else 1
+            if text_units + char_units > MAX_TELEGRAM_TEXT_LENGTH - 1:
+                break
+            prefix.append(char)
+            text_units += char_units
+        return "".join(prefix).rstrip() + "…"
+    return text
+
+
+async def edit_stream_message(context, message, text, message_state):
+    text = fit_telegram_text(text)
+    if text == message_state["text"]:
+        return
+
+    loop = asyncio.get_running_loop()
+    wait_time = MIN_TELEGRAM_EDIT_INTERVAL - (
+        loop.time() - message_state["last_edit"]
     )
+    if wait_time > 0:
+        await asyncio.sleep(wait_time)
+
+    for attempt in range(3):
+        try:
+            await context.bot.edit_message_text(
+                text=text,
+                chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
+            break
+        except RetryAfter as error:
+            if attempt == 2:
+                raise
+            retry_after = error.retry_after
+            if hasattr(retry_after, "total_seconds"):
+                retry_after = retry_after.total_seconds()
+            await asyncio.sleep(max(float(retry_after), 0.1) + 0.1)
+        except BadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+            break
+
+    message_state["text"] = text
+    message_state["last_edit"] = loop.time()
 
 
-async def stream_model_response(messages, context, message):
+async def stream_model_response(messages, context, message, message_state):
     loop = asyncio.get_running_loop()
     chunks = asyncio.Queue()
     displayed_text = ""
-    last_displayed_length = 0
-    last_edit = loop.time()
+    typing_status_shown = False
 
     def receive_chunk(chunk):
         loop.call_soon_threadsafe(chunks.put_nowait, chunk)
@@ -856,15 +900,28 @@ async def stream_model_response(messages, context, message):
             chunk = ""
         if chunk is not None:
             displayed_text += chunk
+            if chunk.strip() and not typing_status_shown:
+                await edit_stream_message(
+                    context,
+                    message,
+                    "✍️ Печатает…",
+                    message_state,
+                )
+                typing_status_shown = True
+
         now = loop.time()
         if (
-            len(displayed_text) - last_displayed_length >= 24
-            and now - last_edit >= 0.8
+            typing_status_shown
             and displayed_text.strip()
+            and fit_telegram_text(displayed_text) != message_state["text"]
+            and now - message_state["last_edit"] >= MIN_TELEGRAM_EDIT_INTERVAL
         ):
-            await edit_stream_message(context, message, displayed_text)
-            last_displayed_length = len(displayed_text)
-            last_edit = now
+            await edit_stream_message(
+                context,
+                message,
+                displayed_text,
+                message_state,
+            )
         if chunk is None:
             break
 
@@ -878,18 +935,24 @@ async def handle_message(
     user_id = update.effective_user.id
     user_text = update.message.text
 
-    profile = get_profile(user_id)
-    history = get_history(user_id)
-
-    messages = build_messages(
-        history, user_text, system_prompt=build_profile_prompt(profile)
-    )
-
-    stream_message = await update.message.reply_text("…")
+    stream_message = await update.message.reply_text("🤔 Думает…")
+    loop = asyncio.get_running_loop()
+    message_state = {
+        "text": "🤔 Думает…",
+        "last_edit": loop.time(),
+    }
     typing_task = asyncio.create_task(keep_typing(update.message.chat))
 
     try:
-        answer = await stream_model_response(messages, context, stream_message)
+        profile = get_profile(user_id)
+        history = get_history(user_id)
+        messages = build_messages(
+            history, user_text, system_prompt=build_profile_prompt(profile)
+        )
+
+        answer = await stream_model_response(
+            messages, context, stream_message, message_state
+        )
         answer = strip_internal_reasoning(answer)
 
         if answer_has_unwanted_language(answer, user_text):
@@ -909,9 +972,14 @@ async def handle_message(
                 user_text,
                 system_prompt=retry_prompt,
             )
-            await edit_stream_message(context, stream_message, "…")
+            await edit_stream_message(
+                context,
+                stream_message,
+                "🤔 Думает…",
+                message_state,
+            )
             answer = await stream_model_response(
-                retry_messages, context, stream_message
+                retry_messages, context, stream_message, message_state
             )
             answer = strip_internal_reasoning(answer)
 
@@ -924,13 +992,14 @@ async def handle_message(
         # В историю попадает только итоговый ответ, а не неудачная генерация.
         add_history_pair(user_id, user_text, answer)
 
-        await edit_stream_message(context, stream_message, answer)
+        await edit_stream_message(context, stream_message, answer, message_state)
 
     except requests.exceptions.Timeout:
         await edit_stream_message(
             context,
             stream_message,
-            "⏳ Qwen слишком долго отвечает. Попробуй ещё раз."
+            "⏳ Qwen слишком долго отвечает. Попробуй ещё раз.",
+            message_state,
         )
 
     except requests.exceptions.RequestException as error:
@@ -939,7 +1008,8 @@ async def handle_message(
             context,
             stream_message,
             "⚠️ Не удалось подключиться к серверу Qwen. "
-            "Проверь, доступен ли компьютер с Qwen и запущен ли сервер модели."
+            "Проверь, доступен ли компьютер с Qwen и запущен ли сервер модели.",
+            message_state,
         )
 
     except Exception as error:
@@ -950,7 +1020,8 @@ async def handle_message(
         await edit_stream_message(
             context,
             stream_message,
-            "Произошла ошибка при обработке сообщения."
+            "Произошла ошибка при обработке сообщения.",
+            message_state,
         )
 
     finally:
