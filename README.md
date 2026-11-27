@@ -1,4 +1,4 @@
-# Blatmetro Secretary — Test Bot №1
+# Blatmetro Secretary — Test Bot
 
 Отдельная тестовая копия Telegram-бота. Исходная папка `BlatmetroSecretary_LocalAI`
 и проект `BlatmetroSecretary_Training` в архиве сохранены без изменений.
